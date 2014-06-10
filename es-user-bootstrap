@@ -38,8 +38,8 @@ which mr || pacaur --noconfirm --noedit -S myrepos
 which vcsh || pacaur --noconfirm --noedit -S vcsh
 sudo pacman --noconfirm -S hub
 
-vcsh clone https://github.com/altercation/es-dotfiles.git es-dotfiles
-mr update
+vcsh clone https://github.com/altercation/es-dotfiles.git es-dotfiles || true
+mr update || true
 
 [ -e ${HOME}/.ssh/id_ecdsa.pub ] || ssh-keygen -t ecdsa -b 521 -C "$(whoami)@$(hostname)-$(date -I)"
 xclip -sel clip < ~/.ssh/id_ecdsa.pub
