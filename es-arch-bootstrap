@@ -1,0 +1,1030 @@
+#!/usr/bin/zsh
+
+setopt ERR_EXIT NO_UNSET #VERBOSE XTRACE
+
+
+:<< \
+-----------------------------------------------------------------------
+atypical.sh
+
+Archlinux - A Typical Install Script
+Ethan Schoonover <es@ethanschoonover.com>
+-----------------------------------------------------------------------
+
+
+:<< \
+-----------------------------------------------------------------------
+FRONTMATTER - don't change this section
+-----------------------------------------------------------------------
+typeset -A INSTALL SYSTEM CONFIG
+INSTALL[MOUNT_ROOT]=/mnt
+
+
+:<< \
+-----------------------------------------------------------------------
+BLOCK DEVICE CONFIGURATION - change only this
+-----------------------------------------------------------------------
+# child items should be listed below parent items in table for later
+# parsing and path assignment
+
+# Get memory for use in partition/filesystem table
+RAM="$(( $(print ${$(cat /proc/meminfo | grep -i memtotal)[2]}) / 1000000 ))G"
+
+# Yes, luks is not an FSTYPE and btrfs subvolumes aren't block devices at all, but they are within the scope
+# of filesystem setup and creation, and that is what this table is. Really this should be renamed "STORAGE_TABLE"
+
+# btrfs subvolumes can be listed as fstype "btrfs" and as long as their parent volume (or subvolume) is also listed as btrfs they will be identified as subvolumes
+
+# arbitrary columns can be added to this table for use in the scripts below; just be sure that each colume entry has a - (dash) or value (space escaped, quoted, or no whitespace) for each "cell" in the table.
+
+BLOCKTABLE=("${(@f)$(cat <<\
+==========================================================================
+SIZE   CODE   LABEL       CHILD_OF    FSTYPE   MOUNT_POINT   MOUNT_OPTIONS
+--------------------------------------------------------------------------
+512M   ef00   EFI         -           fat      /boot         -
+$RAM   8300   cryptswap   -           luks     -             -
+max    8300   cryptsys    -           luks     -             -
+-      -      swap        cryptswap   swap     -             -
+-      -      system      cryptsys    btrfs    -             -
+-      -      root        system      btrfs    /             -
+-      -      home        system      btrfs    /home         -
+==========================================================================
+)}")
+
+# GENERAL MKFS, LUKS, and MOUNT OPTIONS
+# USE COLUMN NAME VARIABLES WITH UNDERSCORE PREFIX FOR RUN TIME REPLACEMENT
+# e.g. $_LABEL will be replaced with the LABEL column value for the specific block item at run time
+
+INSTALL[MKFS_OPTIONS]=''
+INSTALL[MKFS_OPTIONS,SSD]=''
+INSTALL[MKFS_OPTIONS,FAT]='-F32 -n $_LABEL'
+INSTALL[MKFS_OPTIONS,FAT,SSD]=''
+INSTALL[MKFS_OPTIONS,BTRFS]='--force --label $_LABEL'
+INSTALL[MKFS_OPTIONS,BTRFS,SSD]='--metadata single' # see man mkfs.btrfs
+
+INSTALL[MOUNT_OPTIONS]='rw'
+INSTALL[MOUNT_OPTIONS,SSD]='noatime'
+INSTALL[MOUNT_OPTIONS,BTRFS]='compress=lzo,space_cache,autodefrag,inode_cache,'
+INSTALL[MOUNT_OPTIONS,BTRFS,SSD]='ssd,discard_space' # ssd,discards,recovery
+INSTALL[MOUNT_OPTIONS,LUKS]='' # 'x-systemd.device-timeout=0 0 0' # cf https://bugzilla.redhat.com/show_bug.cgi?id=861123
+
+INSTALL[LUKS_FORMAT_OPTIONS]='--force-password' # --force-password allows weak passphrases (for testing only)
+INSTALL[LUKS_OPEN_OPTIONS]=''
+INSTALL[LUKS_OPEN_OPTIONS,SSD]='--allow-discards'
+
+CONFIG[GRAPHICS]=intel
+
+:<< \
+=======================================================================
+DON'T CHANGE BELOW THIS POINT
+=======================================================================
+if [[ "$(whoami)" != "root" ]]; then
+    print "Must be root to run this install script. Exiting."
+    exit
+fi
+
+:<< \
+-----------------------------------------------------------------------
+HELPER FUNCTIONS
+-----------------------------------------------------------------------
+
+# General
+
+removeFromArray() { eval $1=\("\${(@)$1:#$2}"\); }
+
+addToCommaList () {
+    varname=$1
+    typeset -g $varname
+    varcontent="${(P)1}"
+    shift
+    for newvalue in $@; do
+        varcontent="${varcontent%,}${varcontent:+,}${newvalue#,}"
+    done
+    typeset -g $varname="${varcontent%,}"
+}
+
+# Passphrase
+
+setPassphrase() {
+        returnvar=$1
+        typeset -g $returnvar
+	typeset passphrase="" confirmation=""
+        prompt="${2:-passphrase}"
+	while [[ -z "$passphrase" ]]; do
+	    print -n " Enter $prompt   : "
+	    read -rs passphrase
+            print
+	    print -n " Confirm $prompt : "
+	    read -rs confirmation
+            print
+	    #print; read -rs "passphrase?Enter $prompt : "
+	    #echo "\n\n"; read -rs "confirmation?Confirm $prompt    : "
+	    #echo "\n\n"
+	    if [[ "$passphrase" != "$confirmation" ]]; then
+		print "\nInput does not match!"
+		passphrase="" confirmation=""
+	    fi
+	done
+	#print -rn "$passphrase"
+        typeset -g $returnvar="$passphrase"
+	unset passphrase confirmation
+}
+
+# Block Device Related
+
+deviceHasMountpoint() { [[ -n "$(/usr/bin/lsblk -dno MOUNTPOINT $1)" ]]; }
+
+deviceOrChildHasMountpoint() { [[ -n "$(/usr/bin/lsblk -no MOUNTPOINT $1)" ]]; }
+
+setCurrentBlockItem () {
+    local itemnumber=$1
+    ITEMVALUES=($COLNAMES PATH PARTNUM MOUNTED_BTRFS_SUBVOL)
+    for VALUENAME in $ITEMVALUES; do
+        [[ -z ${BLOCKITEM[$itemnumber,$VALUENAME]:-} ]] || typeset -g _$VALUENAME="${BLOCKITEM[$itemnumber,$VALUENAME]}"
+    done
+    if [[ -n ${_CHILD_OF:-} ]]; then
+        local parentitemnumber=${BLOCKITEM_NUM_FROM_LABEL[$_CHILD_OF]:-}
+        for VALUENAME in $ITEMVALUES; do
+            [[ -z ${BLOCKITEM[$parentitemnumber,$VALUENAME]:-} ]] || typeset -g _PARENT_$VALUENAME="${BLOCKITEM[$parentitemnumber,$VALUENAME]}"
+        done
+    fi
+}
+
+unsetCurrentBlockItem () {
+    ITEMVALUES=($COLNAMES PATH PARTNUM MOUNTED_BTRFS_SUBVOL)
+    for VALUENAME in $ITEMVALUES; do
+        unset _$VALUENAME
+        unset _PARENT_$VALUENAME
+    done
+}
+
+getParentFilesystemTypeFromLabel () {
+    this_label=$1
+    this_item_num=$BLOCKITEM_NUM_FROM_LABEL[$this_label]
+    parent_label="${BLOCKITEM[$this_item_num,CHILD_OF]:-}"
+    if [[ -n $parent_label ]]; then
+        parent_item_num=$BLOCKITEM_NUM_FROM_LABEL[$parent_label]
+        parent_item_fs="${BLOCKITEM[$parent_item_num,FSTYPE]}"
+        print -n $parent_item_fs
+    else
+        return 1
+    fi
+}
+
+checkForLuksAncestor () {
+    this_label=$1
+    this_item_num=$BLOCKITEM_NUM_FROM_LABEL[$this_label]
+    parent_fs=$(getParentFilesystemTypeFromLabel $this_label)
+    if [[ $parent_fs == luks ]]; then
+        return 0
+    elif [[ -n ${BLOCKITEM[$this_item_num,CHILD_OF]:-} ]]; then
+        checkForLuksAncestor ${BLOCKITEM[$this_item_num,CHILD_OF]}
+    else
+        return 1
+    fi
+}
+
+:<< \
+'-----------------------------------------------------------------------'
+DISK SELECTION
+-----------------------------------------------------------------------
+
+# Create list of drives
+# Remove mounted drives from list
+drives=($(/usr/bin/lsblk --paths --nodeps --noheadings --output NAME))
+print -l "$drives"
+for drive in $drives; do deviceOrChildHasMountpoint $drive && removeFromArray drives $drive || :; done
+print "----------"
+print -l "$drives"
+
+# User selects drive for install
+CONFIRM="" SELECTED=""
+while [[ ! $CONFIRM =~ [Yy] ]]; do
+
+        # List drives
+        echo "\n\n\nAvailable unmounted drives for installation:"
+        echo "--------------------------------------------"
+	for drive in $drives; do print "[$(( i += 1))] $drive ($(/usr/bin/lsblk -dno SIZE $drive))"; done
+
+        # Pick drive or quit
+	echo -n "\nPlease enter the number of the drive you wish to install to, or 'q' to quit: (1$((($i > 1)) && echo "-$i")/q) "
+	while [[ -z $SELECTED || ! $SELECTED =~ [1-$i] && ! ${(L)SELECTED} == "q" ]]; do print -n "\b \b"; read -k 1 SELECTED || :; done # read returns an error code at EOF, so we ignore it
+        if [[ $SELECTED == "q" ]]; then echo; exit; fi
+
+        # Identify as SSD or standard
+	echo -n "\nIs $drives[$SELECTED] an SSD? (y/N):"
+        read -k SSD || :; [[ ${(L)SSD} == y ]] && SSD="" || unset SSD; echo
+
+        # Summarize and confirm
+	echo -n "\n\nYou have selected $drives[$SELECTED] for COMPLETE ERASURE, and identified it as ${SSD-NOT }an SSD. Enter'y' to continue or 'n' to make changes or 'q' to quit: (y/N/q) "
+        read -k CONFIRM ||:; echo
+        [[ ${(L)CONFIRM} == "q" ]] && exit || :
+
+done
+
+INSTALL[DRIVE]=$drives[$SELECTED]
+
+
+:<< \
+-----------------------------------------------------------------------
+PARSE BLOCKITEM TABLE
+-----------------------------------------------------------------------
+
+echo "\n\nInstallation to $INSTALL[DRIVE] beginning...\n\n"
+
+# Parse blockitem table
+COLNAMES=($(print ${BLOCKTABLE[1]}))
+unset "BLOCKTABLE[1,2]" # remove column header
+TABLEVAL=($(print ${BLOCKTABLE[@]}));
+NUM_OF_BLOCKITEMS=$(( ${#TABLEVAL} / ${#COLNAMES} ))
+if (( ${#TABLEVAL} > (${#COLNAMES} * $NUM_OF_BLOCKITEMS) )); then
+    print "\nBLOCK DEVICE TABLE FORMAT ERROR!"
+    print "Check that the block device table is properly formatted and that there there is one item per label per row.\nExiting.\n"
+    exit
+fi
+
+# Assign values to blockitems
+typeset -A BLOCKITEM
+ITERATION=0
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    for COLINDEX in {1..${#COLNAMES}}; do
+        TABLE_CELL_VALUE="$TABLEVAL[$((${#COLNAMES} * $ITERATION + $COLINDEX))]"
+        [[ ! "$TABLE_CELL_VALUE" =~ [_-] ]] && BLOCKITEM[${BLOCKITEM_NUM},${COLNAMES[$COLINDEX]}]="$TABLEVAL[$((${#COLNAMES} * $ITERATION + $COLINDEX))]" || :
+        #DEBUG echo "${BLOCKITEM_NUM},${COLNAMES[$COLINDEX]}: ${BLOCKITEM[${BLOCKITEM_NUM},${COLNAMES[$COLINDEX]}]:-NOT SET}"
+    done
+    ITERATION=$(( $ITERATION + 1 ))
+done
+
+# Create utility reverse-lookup arrays
+typeset -A BLOCKITEM_NUM_FROM_LABEL BLOCKITEM_NUM_FROM_MOUNT_POINT
+PARTNUM=0
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    BLOCKITEM_NUM_FROM_LABEL[$_LABEL]=${BLOCKITEM_NUM}
+    [[ -z ${_MOUNT_POINT:-} ]] || BLOCKITEM_NUM_FROM_MOUNT_POINT[$_MOUNT_POINT]=${BLOCKITEM_NUM}
+    unsetCurrentBlockItem
+done
+ALL_MOUNTS=($(print -l ${(k)BLOCKITEM_NUM_FROM_MOUNT_POINT} | sort))
+
+# Assemble install paths
+PARTNUM=0
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    if [[ -z ${_CHILD_OF:-} ]]; then
+        (( PARTNUM += 1 ))
+        BLOCKITEM[${BLOCKITEM_NUM},PARTNUM]=$PARTNUM
+        BLOCKITEM[${BLOCKITEM_NUM},PATH]=${INSTALL[DRIVE]}${PARTNUM}
+    elif [[ ${(L)_PARENT_FSTYPE} == "luks" ]]; then
+        BLOCKITEM[${BLOCKITEM_NUM},PATH]=/dev/mapper/${_PARENT_LABEL}
+    elif [[ ${(L)_PARENT_FSTYPE} == "btrfs" && ${(L)_FSTYPE} == "btrfs" ]]; then
+        # a btrfs subvolume
+        # child items must always follow parent items in table for this to work
+        BLOCKITEM[${BLOCKITEM_NUM},PATH]=$_PARENT_PATH
+        BLOCKITEM[${BLOCKITEM_NUM},BTRFS,SUBVOLUME]=true
+    else
+        print "Unknown parent/child relationship found for block table entry ${BLOCKITEM_NUM} ($_LABEL)."
+        print "Child FSTYPE:  $_FSTYPE"
+        print "Parent FSTYPE: $_PARENT_FSTYPE"
+        print "Exiting."
+        exit
+    fi
+    unsetCurrentBlockItem
+done
+
+# Create partitioning command
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    if [[ -n ${_CODE:-} ]]; then 
+        [[ ${(L)_SIZE} == max ]] && new_cmd="--largest-new=$_PARTNUM" || new_cmd="--new=$_PARTNUM:0:+${_SIZE}"
+        [[ ${(L)_LABEL} == boot || ${(L)_LABEL} == efi ]] && eval attr_cmd="--attributes=$_PARTNUM\:set\:0" || attr_cmd="" 
+        sgdisk_cmd="${sgdisk_cmd:-} $new_cmd --typecode=$_PARTNUM:${BLOCKITEM[$BLOCKITEM_NUM,CODE]} --change-name=$_PARTNUM:${BLOCKITEM[$BLOCKITEM_NUM,LABEL]} $attr_cmd"
+    fi
+    unsetCurrentBlockItem
+done
+sgdisk_cmd="${sgdisk_cmd:-} ${INSTALL[DRIVE]}"
+
+# Test Output of all table key value pairs
+#print "$(for BLOCKITEMKEY in ${(k)BLOCKITEM}; do echo -e "$BLOCKITEMKEY:\t\t${BLOCKITEM[$BLOCKITEMKEY]}"; done)" | sort
+#echo "sgdisk $sgdisk_cmd"
+#exit
+
+
+:<< \
+'-----------------------------------------------------------------------'
+DISK PREPARATION
+
+# debugging crypto close
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    if [[ ${(L)_FSTYPE} == luks ]]; then
+        cryptsetup close $_LABEL || :
+    fi
+    unsetCurrentBlockItem
+done
+-----------------------------------------------------------------------
+
+# Erase drive, create new GPT structure, and create partitions
+sgdisk --zap-all ${INSTALL[DRIVE]}
+sgdisk --clear ${INSTALL[DRIVE]}
+eval sgdisk $sgdisk_cmd
+
+
+:<< \
+'-----------------------------------------------------------------------'
+ENCRYPT BLOCKITEMS
+-----------------------------------------------------------------------
+
+# Check if we need encryption
+ENCRYPTION=false
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    [[ ${(L)_FSTYPE} == luks ]] && ENCRYPTION=true || :
+    unsetCurrentBlockItem
+done
+
+if [[ $ENCRYPTION == true ]]; then
+
+    # Get passphrase
+    setPassphrase PASSPHRASE "disk encryption passphrase"
+    #PASSPHRASE=DEBUG
+
+    # Encrypt partitions
+    for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+        setCurrentBlockItem $BLOCKITEM_NUM
+        if [[ ${(L)_FSTYPE} == luks ]]; then
+        print "Encrypting $_LABEL on $_PATH ... "
+            print -r "$PASSPHRASE" | cryptsetup ${INSTALL[LUKS_FORMAT_OPTIONS]:-} luksFormat $_PATH
+            print -r "$PASSPHRASE" | cryptsetup open ${INSTALL[LUKS_OPEN_OPTIONS]:-} ${SSD:-${INSTALL[LUKS_OPEN_OPTIONS,SSD]:-}} $_PATH $_LABEL
+        fi
+        unsetCurrentBlockItem
+    done
+
+    # Cleanup
+    unset PASSPHRASE
+
+fi
+
+
+:<< \
+'-----------------------------------------------------------------------'
+MAKE FILESYSTEMS
+-----------------------------------------------------------------------
+
+# FIRST PASS: isn't luks, doesn't have "child of"
+# (so should be our top level physical partitions)
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    if [[ ${(L)_FSTYPE} != luks && -z ${_CHILD_OF:-} ]]; then
+        MKFS_OPTIONS="${INSTALL[MKFS_OPTIONS,${(U)_FSTYPE}]:-} ${INSTALL[MKFS_OPTIONS,${(U)_FSTYPE},SSD]:-} ${_MKFS_OPTIONS:-}"
+        eval mkfs.${(L)_FSTYPE} $MKFS_OPTIONS ${_PATH}
+    fi
+    unsetCurrentBlockItem
+done
+
+# SECOND PASS: isn't luks itself but is "child of" luks
+# (filesystems installed on luks)
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    if [[ ${(L)_FSTYPE} != luks && ${(L)_PARENT_FSTYPE:-} == luks ]]; then
+        if [[ ${(L)_FSTYPE} == swap  ]]; then
+            eval mkswap --label $_LABEL $_PATH
+            eval swapon -L $_LABEL
+        else
+            MKFS_OPTIONS="${INSTALL[MKFS_OPTIONS,${(U)_FSTYPE}]:-} ${INSTALL[MKFS_OPTIONS,${(U)_FSTYPE},SSD]:-} ${_MKFS_OPTIONS:-}"
+            eval mkfs.${(L)_FSTYPE} $MKFS_OPTIONS ${_PATH}
+        fi
+    fi
+    unsetCurrentBlockItem
+done
+
+# THIRD PASS: isn't luks, is a "child of" but NOT of luks, so probably special case of btrfs subvolumes (or LVM if I choose to implement it)
+for BLOCKITEM_NUM in {1..$NUM_OF_BLOCKITEMS}; do
+    setCurrentBlockItem $BLOCKITEM_NUM
+    if [[ ${(L)_FSTYPE} != luks && -n ${_CHILD_OF:-} && ${(L)_PARENT_FSTYPE} != luks ]]; then
+        if [[ ${(L)_FSTYPE} == btrfs && ${(L)_PARENT_FSTYPE} == btrfs ]]; then
+            # a btrfs subvolume
+            mount $_PARENT_PATH $INSTALL[MOUNT_ROOT]
+            if [[ -n ${_MOUNT_POINT#/} && -n ${_PARENT_MOUNT_POINT:-} ]]; then
+            # create the subvolume as a subdirectory of a parent volume that will itself be mounted
+                dirname=${_MOUNT_POINT:t}
+                dirpath=${_MOUNT_POINT:h}
+                MOUNT_POINT=${INSTALL[MOUNT_ROOT]%/}/${_MOUNT_POINT#/}
+                mkdir -p ${MOUNT_POINT:h}
+                eval btrfs subvolume create ${MOUNT_POINT%/}/$_LABEL 
+            else
+            # create the subvolumes as stand alone "peers" on a parent volume that will not itself be mounted
+                eval "btrfs subvolume create ${INSTALL[MOUNT_ROOT]%/}/$_LABEL"
+                eval "BLOCKITEM[$BLOCKITEM_NUM,MOUNT_OPTIONS]=\"${_MOUNT_OPTIONS:-}${_MOUNT_OPTIONS:+,}subvol=$_LABEL\""
+                eval "BLOCKITEM[$BLOCKITEM_NUM,MOUNTED_BTRFS_SUBVOL]=true"
+            fi
+            umount $INSTALL[MOUNT_ROOT]
+        else
+            # some case I haven't built for yet
+            print "Filesystem of type $_FSTYPE set as child of parent device with filesystem of type $_FSTYPE: No procedure set for this condition. Exiting."
+            exit 1
+        fi
+    fi
+    unsetCurrentBlockItem
+done
+
+# Mount
+for MOUNT_POINT in $ALL_MOUNTS; do
+
+    setCurrentBlockItem $BLOCKITEM_NUM_FROM_MOUNT_POINT[$MOUNT_POINT]
+    MOUNT_OPTIONS=""
+
+    # build mount option list
+    addToCommaList MOUNT_OPTIONS ${_MOUNT_OPTIONS:-} ${INSTALL[MOUNT_OPTIONS]:-} ${INSTALL[MOUNT_OPTIONS,${(U)_FSTYPE}]:-}
+    if [[ -n ${SSD:-} ]]; then addToCommaList MOUNT_OPTIONS ${INSTALL[MOUNT_OPTIONS,SSD]:-} ${INSTALL[MOUNT_OPTIONS,${(U)_FSTYPE},SSD]:-}; fi
+    if checkForLuksAncestor $_LABEL; then addToCommaList MOUNT_OPTIONS ${INSTALL[MOUNT_OPTIONS,LUKS]:-}; fi
+
+    # take table mount point and combine with system install mount point
+    MOUNT_POINT=${INSTALL[MOUNT_ROOT]%/}/${_MOUNT_POINT#/}
+
+    # handle possible btrfs subvolume specific issues
+    if [[ -n ${_PARENT_MOUNT_POINT:-} ]]; then
+        PARENT_MOUNT_POINT=${INSTALL[MOUNT_ROOT]%/}/${_PARENT_MOUNT_POINT#/}
+        if findmnt $PARENT_MOUNT_POINT &>/dev/null; then
+            # if parent btrfs volume is mounted, the subvolumes are already present... don't need to do anything here?
+            #mkdir -p ${MOUNT_POINT}
+            :
+        else
+            print "Parent device not mounted but required for mounting of filesystem (likely a btrfs subvolume)."
+            print "Parent: $_PARENT_LABEL  Attempting to mount: $_LABEL"
+            exit
+        fi
+    fi
+    #mount $MOUNT_OPTIONS ${_PATH} ${INSTALL[MOUNT_ROOT]%/}/${_MOUNT_POINT#/}
+    [[ -n ${_MOUNTED_BTRFS_SUBVOL:-} ]] && LABEL=$_PARENT_LABEL || LABEL=$_LABEL
+    MOUNT_POINT=${INSTALL[MOUNT_ROOT]%/}/${_MOUNT_POINT#/}
+    mkdir -p ${MOUNT_POINT}
+    eval "mount -o $MOUNT_OPTIONS LABEL=$LABEL $MOUNT_POINT"
+    unsetCurrentBlockItem
+
+done
+
+# Make fstab
+#mkdir -p ${INSTALL[MOUNT_ROOT]%/}/etc
+
+
+:<< \
+-----------------------------------------------------------------------
+INSTALL BASE SYSTEM
+-----------------------------------------------------------------------
+pacstrap /mnt base #base-devel
+genfstab -L /mnt > /mnt/etc/fstab
+refind-install --root /mnt
+mv /mnt/boot/EFI/refind /mnt/boot/EFI/BOOT
+mv /mnt/boot/EFI/BOOT/refind_x86.efi /mnt/boot/EFI/BOOT/bootx86.efi
+
+
+:<< \
+'-----------------------------------------------------------------------'
+#cat > /mnt/boot/refind_linux.conf <<EOF
+"Boot with standard options"        "ro root=/dev/mapper/cryptsys rd.luks.uuid=cryptsys rd.luks.uuid=luks-149221bc-52aa-4862-b640-c36cefbf551b vconsole.font=Lat2-Terminus16 modprobe.blacklist=i915 i915.modeset=0 radeon.modeset=1 radeon.dpm=1 radeon.agpmode=8 radeon.aspm=1 radeon.fastfb=1 ipv6.disable=1 quiet"
+"Boot to single-user mode"          "SAME CONTENT AS STANDARD BUT WITH single"
+"Boot with minimal options"         "ro root=/dev/mapper/cryptsys"
+#EOF
+-----------------------------------------------------------------------
+
+# DUMP REMAINDER OF FILE INTO CHROOT & EXECUTE IT THERE, THEN CLEAN UP & EXIT
+# ------------------------------------------------------------------------------
+# extract everything after this section with necessary variables prefixed
+echo "declare -A CONFIG" >> /mnt/install.sh
+for key in "${!CONFIG[@]}"
+do    
+    echo "CONFIG[$key]=\"${CONFIG[$key]}\"" >> /mnt/install.sh
+done
+sed -n "/>\{10\}/,$ p" "$0" >> /mnt/install.sh
+chmod +x /mnt/install.sh
+
+exit
+
+arch-chroot /mnt /install.sh; rm /mnt/install.sh;
+umount -R /mnt/boot; umount -R /mnt; cryptsetup close crypt
+echo "check mkinitcpio.conf, efi boot params, etc. and then reboot"; exit
+#reboot
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>> CHROOT TRIM LINE <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+# INSTALL OTHER BASIC SYSTEM-RELATED PACKAGES
+# ------------------------------------------------------------------------------
+pacman --noconfirm -S sudo vim git gptfdisk
+
+
+# LOCALE, TIME, HOSTNAME
+# ------------------------------------------------------------------------------
+
+# any reason to actually export this here besides faith in the arch-wiki?
+export LANG=en_US.UTF-8
+
+# append rather than uncomment preferred locale & then generate
+# echo -e "en_US.UTF-8 UTF-8\nen_US ISO-8859-1" >> /etc/locale.gen
+echo -e 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+locale-gen
+
+# set preferred locale in locale.conf
+echo LANG=en_US.UTF-8 > /etc/locale.conf
+
+# set preferred vconsole font
+#pacman --noconfirm -S terminus-font
+# echo “FONT=ter-u20b.psf.gz” >> /etc/vconsole.conf # not working - try pcf? include binary in initramfs?
+echo FONT=Lat2-Terminus16 >> /etc/vconsole.conf
+
+# set localtime and hwclock
+ln -s /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+hwclock --systohc --utc
+
+# this hostname
+echo "${CONFIG[HOSTNAME]}" > /etc/hostname
+
+exit
+
+
+# FILESYSTEM UTILS, SNAPSHOTS, & LOCATE
+# ------------------------------------------------------------------------------
+# dosfstools used to fsck the vfat EFI system partition
+pacman --noconfirm -S dosfstools btrfs-progs snapper mlocate
+KEY=PRUNENAMES; VALUE='".git .hg .svn .snapshots"'; FILE=/etc/updatedb.conf
+sed -i "s/\($KEY *= *\).*/\1$VALUE/" $FILE
+# Need to create systemd service:
+: <<OFF
+/etc/systemd/system/timer-daily.target.wants/mlocate-update.service
+[Unit]
+Description=Update mlocate database
+
+[Service]
+Nice=19
+IOSchedulingClass=2
+IOSchedulingPriority=7
+ExecStart=/usr/bin/updatedb -f proc
+OFF
+
+# MODULES & DE/WM BASICS
+# ------------------------------------------------------------------------------
+pacman --noconfirm -S xorg xmonad xmonad-contrib xmobar unclutter
+pacaur --noconfirm --noedit -S compton-git
+
+
+## # MODULES & DE/WM BASICS
+## # ------------------------------------------------------------------------------
+## 
+## # correct video driver
+## 
+## # INTEL
+## if [ ${CONFIG[GRAPHICS]} == intel ]; then
+## pacman --noconfirm -S xf86-video-intel xf86-input-synaptics xf86-input-wacom
+## # lvds downclocking seems to cause problems if using glamor instead of sna in
+## # intel xorg config file. intel xorg config with sna requires tear-free but
+## # evidently tear-free is not a performant as other methods. need to look this up
+## # so far, sna + the lvds downclocking seems to be better in terms of power usage
+## cat > /etc/X11/xorg.conf.d/20-intel.conf <<EOF
+## Section "Device"
+##    Identifier  "Intel Graphics"
+##    Driver      "intel"
+##    Option      "Backlight"      "intel_backlight"
+##    Option      "TearFree"    "true"
+##    Option      "AccelMethod"  "sna"
+## EndSection
+## EOF
+## 
+## #echo "options i915 i915.modeset=0 i915_enable_rc6=7 i915_enable_fbc=1 lvds_downclock=1" > /etc/modprobe.d/i915.conf
+## CONFIG[INIT_MODULES]="${CONFIG[INIT_MODULES]} i915"
+## 
+## # ATI
+## elif [ ${CONFIG[GRAPHICS]} == ati ]; then
+##     pacman --noconfirm -S xf86-video-ati
+## cat > /etc/X11/xorg.conf.d/20-radeon.conf <<EOF
+## Section "Device"
+## 	Identifier  "My Graphics Card"
+## 	Driver	"radeon"
+## 	Option	"SWcursor"              "off" #software cursor might be necessary on some rare occasions, hence set off by default
+## 	Option	"EnablePageFlip"        "on"  #supported on all R/RV/RS4xx and older hardware, and set on by default
+## 	Option	"AccelMethod"           "EXA" #valid options are XAA, EXA and Glamor. Default value varies per-GPU.
+## 	Option	"RenderAccel"           "on"  #enabled by default on all radeon hardware
+## 	Option	"ColorTiling"           "on"  #enabled by default on RV300 and later radeon cards
+## 	Option	"EXAVSync"              "on"  #default is off, otherwise on. Only works if EXA activated
+## 	Option	"EXAPixmaps"            "on"  #when on icreases 2D performance, but may also cause artifacts on some old cards. Only works if EXA activated
+## 	Option	"AccelDFS"              "on"  #default is off, read the radeon manpage for more information
+## EndSection
+## EOF
+## echo "options radeon modeset=1 dpm=1 agpmode=8 aspm=1 fastfb=1" > /etc/modprobe.d/radeon.conf
+## echo "blacklist i915" > /etc/modprobe.d/blacklist.conf
+## CONFIG[INIT_MODULES]="${CONFIG[INIT_MODULES]} radeon"
+## 
+## # UNKNOWN
+## else
+##     echo -n "unknown graphics driver option set for CONFIG[GRAPHICS]: "
+##     echo "${CONFIG[GRAPHICS]}"
+##     exit 1
+## fi
+## 
+## # gnome
+## pacman --noconfirm -S gnome
+## 
+## # gnome radio
+## pacman --noconfirm -S networkmanager gnome-bluetooth
+## 
+## # gnome tweaks and utils
+## pacman --noconfirm -S gnome-tweak-tool gconf-editor
+## 
+## # gnome misc
+## pacman --noconfirm -S gnome-common telepathy
+## 
+## # gnome apps
+## # gnome-calendar-git gnome-shell-google-calendar-git
+## 
+## # gnome extensions
+## : <<-OFF
+## gnome-shell-extension-yawe-git # openweather
+## gnome-shell-extension-topicons
+## gnome-shell-extension-system-monitor-git
+## gnome-shell-extension-starcal
+## gnome-shell-extension-shellshape-git # YES
+## gnome-shell-extension-sensors # YES 
+## gnome-shell-extension-searchbookmarks-git
+## gnome-shell-extension-pulseaudio-chooser-git # YES
+## gnome-shell-extension-noa11y
+## gnome-shell-extension-maximus # YES # requires xorg-xprop, edit of metadata.json
+## gnome-shell-extension-icontopbar
+## gnome-shell-extension-justshowthewindow # YES
+## gnome-shell-extension-gtg-git # cf newer https://github.com/bsaleil/gtg-gnome-shell-extension
+## gnome-shell-extension-focus-effects-git
+## gnome-shell-extension-enhanced-search
+## gnome-shell-extension-windowsnavigator-git
+## gnome-shell-extension-timer-git
+## gnome-shell-extension-mediaplayer-git
+## 
+## # FROM extensions.gnome.org
+## Connection Manager # https://extensions.gnome.org/extension/699/connection-manager/
+## Open Weather # https://extensions.gnome.org/extension/750/openweather/
+## Transparent Windows https://extensions.gnome.org/extension/684/transparent-windows/
+## Minimized Windows List https://extensions.gnome.org/extension/610/minimized-windows-list/
+## Audio Output Switcher https://extensions.gnome.org/extension/751/audio-output-switcher/
+## Advanced Volume Mixer https://extensions.gnome.org/extension/212/advanced-volume-mixer/
+## Media Keys to MPRIS2 https://extensions.gnome.org/extension/695/mediakeys-to-mpris2/
+## OFF
+## 
+## # turn on gnome services
+## systemctl enable gdm
+## systemctl enable NetworkManager
+## systemctl enable bluetooth
+## 
+## # run gsettings (do I need to be user or root? can I set globally? do i need to
+## # have dbus running?) ... maybe create a user post install script otherwise
+## # http://blog.fpmurphy.com/2011/03/customizing-the-gnome-3-shell.html
+## 
+## # INSTALL FROM AUR: gnome-defaults-list
+## # or create /etc/gnome/defaults.list here
+## 
+## 
+## 
+## # PLYMOUTH
+## # ---/---------------------------------------------------------------------------
+## 
+## ##mkdir /var/tmp/plymouth
+## ##cd /var/tmp/plymouth
+## ##curl -O https://aur.archlinux.org/packages/pl/plymouth-release/plymouth-release.tar.gz
+## ##tar -xzvf plymouth-release*tar.gz
+## ##cd plymouth-release
+## ##makepkg -si --noconfirm --asroot
+## #sudo pacman -noconfirm -U plymouth-release*.tar.xz
+## ##cd /
+## ##systemctl disable gdm
+## ##systemctl enable gdm-plymouth
+
+# OTHER DE UTILS
+# ------------------------------------------------------------------------------
+pacman --noconfirm -S file-roller p7zip zip unzip unrar
+#pacman --noconfirm -S gnome-packagekit gnome-settings-daemon-updates
+pacman --noconfirm -S argyllcms dispcalgui gksu
+pacman --noconfirm -S pulseaudio
+# pacman --noconfirm -S spacefm
+
+
+
+
+# PREPARE ENCRYPTED HOME & CONFIGURE FOR MOUNT ON LOGIN
+# ------------------------------------------------------------------------------
+
+# get encrypted home UUID
+##DEV_HOME_UUID=$(lsblk --output UUID ${CONFIG[DEV_HOME]})
+##DEV_HOME_MNT_OPTS="rw,noatime,compress=lzo,space_cache,autodefrag,inode_cache"
+
+# PREPARE ENCRYPTED HOME
+##cryptsetup -y -v luksFormat ${CONFIG[DEV_HOME]}
+##cryptsetup open ${CONFIG[DEV_HOME]} crypt_home
+##mkfs.btrfs -L home /dev/mapper/crypt_home
+# mount here temporarily so we can create a new user home directory later
+# but we don't need this in fstab, nor do we need encrypt as a hook in initcpio
+##mount -o $DEV_HOME_MNT_OPTS /dev/mapper/crypt_home /mnt/home
+
+# install pam_mount to enable mount of LUKS volume at login
+##pacman --noconfirm -S pam_mount
+
+# configure pam_mount
+##sed -i '/<\/pam_mount>/! p' /etc/security/pam_mount.conf.xml
+##cat >> /etc/security/pam_mount.conf.xml <<EOM
+##<volume user="${CONFIG[USERNAME]}" fstype="auto" path="/dev/disk/by-uuid/$DEV_HOME_UUID" mountpoint="/home" options="$DEV_HOME_MOUNT_OPTS" />
+##<mkmountpoint enable="1" remove="true" />
+##</pam_mount>
+##EOM
+
+# configure gdm-password
+#function gdmadd () { sed -i "/$1/ a $2\n" /etc/pam.d/gdm-password; }
+#gdmadd "auth.*pam_gnome_keyring.so.*"    "auth     optional  pam_mount.so"
+#gdmadd "password.*system-local-login.*"  "password optional  pam_mount.so"
+#gdmadd "session.*pam_gnome_keyring.so.*" "session  optional  pam_mount.so"
+
+
+# PERFORMANCE
+# ------------------------------------------------------------------------------
+# cf https://wiki.archlinux.org/index.php/Maximizing_Performance
+
+# Contains, as a percentage of total system memory, the number of pages at which
+# a process which is generating disk writes will start writing out dirty data.
+echo "vm.dirty_ratio = 3" >> /etc/sysctl.d/99-sysctl.conf 
+
+# Contains, as a percentage of total system memory, the number of pages at which
+# the background kernel flusher threads will start writing out dirty data.
+echo "vm.dirty_background_ratio = 2" >> /etc/sysctl.d/99-sysctl.conf 
+
+# The swappiness sysctl parameter represents the kernel's preference (or 
+# avoidance) of swap space. Swappiness can have a value between 0 and 100. 
+# Setting this parameter to a low value will reduce swapping from RAM, and is 
+# known to improve responsiveness on many systems.
+echo "vm.swappiness=1" >> /etc/sysctl.d/99-sysctl.conf 
+echo "vm.vfs_cache_pressure=50" >> /etc/sysctl.d/99-sysctl.conf 
+
+#echo "options ipv6 disable=1" > /etc/modprobe.d/ipv6.conf
+
+# INITRAMFS
+# ------------------------------------------------------------------------------
+
+# configure initramfs
+FILE=/etc/mkinitcpio.conf
+
+KEY=MODULES; VALUE="\"${CONFIG[INIT_MODULES]}\""
+sed -i "s/\($KEY *= *\).*/\1$VALUE/" $FILE
+
+# replace base and udev with systemd... confirm no sideffects?
+#KEY=HOOKS; VALUE='"base udev autodetect modconf block encrypt filesystems keyboard"'
+#KEY=HOOKS; VALUE='"systemd base udev plymouth autodetect modconf block plymouth-encrypt filesystems keyboard"'
+KEY=HOOKS; VALUE='"base udev autodetect modconf console keyboard block encrypt filesystems"'
+sed -i "s/\($KEY *= *\).*/\1$VALUE/" $FILE
+
+mkinitcpio -p linux
+
+
+# EFISTUB
+# ------------------------------------------------------------------------------
+
+## >>> pacman --noconfirm -S efibootmgr
+
+#CONFIG[KERNEL_PARAMS]="initrd=\\initramfs-linux.img root=/dev/mapper/${CONFIG[CRYPTMAPPED_NAME]} cryptdevice=PARTLABEL=${CONFIG[SYSTEMPART_NAME]}:${CONFIG[CRYPTMAPPED_NAME]} zswap.enabled=1 ipv6.disable=1 quiet splash rw"
+#CONFIG[KERNEL_PARAMS]="initrd=\\initramfs-linux.img root=/dev/mapper/${CONFIG[CRYPTMAPPED_NAME]} cryptdevice=UUID=${CONFIG[SYSTEMPART_UUID]}:${CONFIG[CRYPTMAPPED_NAME]} rw"
+## >>> CONFIG[KERNEL_PARAMS]="initrd=\\initramfs-linux.img root=/dev/mapper/${CONFIG[CRYPTMAPPED_NAME]} cryptdevice=${CONFIG[DEV_INSTALL]}2:${CONFIG[CRYPTMAPPED_NAME]} zswap.enabled=1 ipv6.disable=1 quiet splash rw"
+
+# Find and delete existing boot entry with same name
+##>>> EXISTING_ENTRY="$(efibootmgr | grep "${CONFIG[BOOTLABEL]}" | sed "s/Boot\(.*\)\*.*/\1/")"
+##>>> [[ -n "$EXISTING_ENTRY" ]] && efibootmgr -b $EXISTING_ENTRY -B
+
+# Create new boot entry
+##>>> efibootmgr -c -d ${CONFIG[DEV_INSTALL]} -p 1 -l /vmlinuz-linux -L "${CONFIG[BOOTLABEL]}" -u "${CONFIG[KERNEL_PARAMS]}"
+
+
+pacman --noconfirm -S refind-efi
+mkdir -p /boot/efi/EFI/refine || :
+cp /usr/share/refind/refind_x64.efi /boot/efi/EFI/refind/refind_x64.efi
+cp /usr/share/refind/refind.conf-sample  /boot/efi/EFI/refind/refind.conf
+cp -r /usr/share/refind/icons /boot/efi/EFI/refind/
+cp -r /usr/share/refind/fonts /boot/efi/EFI/refind/
+cp -r /usr/share/refind/drivers_x64 /boot/efi/EFI/refind/
+cat > /boot/efi/EFI/refind/refind.conf <<-EOM
+CONFIG[KERNEL_PARAMS]="initrd=\\initramfs-linux.img root=/dev/mapper/${CONFIG[CRYPTMAPPED_NAME]} cryptdevice=${CONFIG[DEV_INSTALL]}2:${CONFIG[CRYPTMAPPED_NAME]} zswap.enabled=1 ipv6.disable=1 quiet splash rw"
+menuentry "Arch Linux" {
+        icon    EFI/refind/icons/os_arch.icns
+        loader  vmlinuz-linux
+        initrd  initramfs-linux.img
+        options "${CONFIG[KERNEL_PARAMS]} add_efi_memmap"
+}
+EOM
+
+# USER SETUP
+# ------------------------------------------------------------------------------
+
+# root password
+#passwd
+
+# new user (only reason we needed to mount the new encrypted /home earlier)
+useradd -m -g users -G wheel -s /bin/bash ${CONFIG[USERNAME]}
+
+# TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#passwd es
+
+# allow wheel
+#visudo
+cp /etc/sudoers.d /var/tmp/sudoers.new
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" > /var/tmp/sudoers.wheel
+visudo -cf /var/tmp/sudoers.wheel && mv /var/tmp/sudoers.wheel /etc/sudoers.d/wheel || echo "ERROR updating sudoers; no change made"
+
+
+# POST USER LOGIN INSTALLS
+# ------------------------------------------------------------------------------
+
+# aura
+cat > /home/${CONFIG[USERNAME]}/aura-install.sh <<'EOM'
+#!/bin/bash
+pacman --noconfirm -S abs
+curl -O https://aur.archlinux.org/packages/au/aura-bin/aura-bin.tar.gz
+tar -xzvf aura-bin*tar.gz
+cd aura-bin
+makepkg
+sudo pacman -noconfirm -U aura-bin*.tar.xz
+sudo aura --noconfirm -A powerpill customizepkg # optional: faster downloads / auto editing of PKGBUILDs
+EOM
+
+# apps
+cat > /home/${CONFIG[USERNAME]}/apps-install.sh <<'EOM'
+#!/bin/bash
+sudo aura --noconfirm -A google-chrome ttf-google-fonts-git google-talkplugin
+EOM
+
+chmod +x /home/${CONFIG[USERNAME]}/*.sh
+
+# snapper setup
+snapper -c root create-config /
+snapper -c var create-config /var # for exclusion other than subvolumes of var
+snapper -c paclib create-config /var/lib/pacman # for inclusion
+snapper -c paccache create-config /var/cache/pacman # for inclusion
+snapper -c home create-config /home
+
+# take initial snapshots
+SNAPDESC="initial install-time snapshot"
+snapper -c root create -d $SNAPDESC
+snapper -c var create -d $SNAPDESC
+snapper -c paclib create -d $SNAPDESC
+snapper -c paccache create -d $SNAPDESC
+snapper -c home create -d $SNAPDESC
+
+# qemu
+pacman --noconfirm -S qemu virt-manager #qemu-launcher useful or not??
+
+
+# EXIT CHROOT
+# ------------------------------------------------------------------------------
+exit
+
+# ------------------------------------------------------------------------------
+: <<'IGNORE'
+# ------------------------------------------------------------------------------
+
+# snapper setup
+# snapper -c root create-config /
+# snapper -c var create-config /var
+# snapper -c pacman create-config /var/lib/pacman
+# snapper -c home create-config /home
+
+# take snapshot
+# snapper create
+
+snapper create -d "
+
+updatedb
+By default, updatedb will also index the .snapshots directory created by snapper, which can cause serious slowdown and excessive memory usage if you have many snapshots. You can prevent updatedb from indexing over it by editing:
+/etc/updatedb.conf
+PRUNENAMES = ".snapshots"
+
+
+
+
+# other gnome/xorg system specific tweaks
+
+# make rotation button on screen bezel show/hide on-screen-keyboard
+# rotation button is keycode 67
+# use xmodmap or setkeycode?
+# install xmodmap and XKeyCaps?
+
+# remap shift-space to underscore
+# xmodmap -e 'keycode 65 = space underscore space'
+
+
+
+
+
+#powertop
+sudo pacman --noconfirm -S powertop
+sudo powertop --calibrate
+sudo powertop --auto-tune
+
+Tips and tricks
+
+PowerTOP suggests a few methods to reduce the power consumption further. However, in the console, PowerTOP does not display the parameters. To find out which ones are suggested, proceed as follows:
+If you have changed parameters (e.g. in PowerTOP), reboot so that the system has default state of the parameters.
+Use PowerTOP to produce a report on parameters: # powertop --html=powerreport.html
+The last tab of the report now shows the actual parameters suggested by the tool to apply to save power.
+Powertop 2.5 includes an --auto-tune feature which sets all tunable options to their GOOD setting. This can be combined with systemd to have the tunables set on boot.
+/etc/systemd/system/powertop.service
+[Unit]
+Description=Powertop tunings
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/bin/powertop --auto-tune
+#"powertop --auto-tune" still needs a terminal for some reason.
+#Possibly a bug?
+Environment="TERM=xterm"
+
+[Install]
+WantedBy=multi-user.target
+
+
+# TLP INSTALL ON x100e I note following optional dependencies
+acpi_call
+acpid
+ethtool
+iw
+lsb-release
+smartmontools
+tp_smapi
+
+
+
+# power management via tlp - https://wiki.archlinux.org/index.php/TLP
+pacman -S tp_smapi acpi_call #thinkpad only 
+pacman -S tlp tlp-rdw
+systemctl enable tlp
+#NOT USING tlp-sleep RIGHT NOW- might have interferred with suspend/resume
+#systemctl enable tlp-sleep
+systemctl enable NetworkManager-dispatcher
+# The configuration file is located at /etc/default/tlp
+# cf http://linrunner.de/en/tlp/docs/tlp-configuration.html
+
+# set up https://wiki.archlinux.org/index.php/Tp_smapi
+# REALLY NEED TO CHECK THIS
+
+
+# add cpupower to monitor where we are at with all this
+pacman -S cpupower
+http://www.thinkwiki.org/wiki/Category:X220_Tablet
+From Thinkwiki:
+It is a known problem for the X220 Tablet (other models may apply), that there is a problem concerning the CPU throttling in LINUX.
+Syntoms vary for different kernels and distributions. Eg in ubuntu the CPU speed gets blocked at low rates and the computer becomes very slow until reboot, in Opensuse the entire desktop freezes (only mouse pointer working) and switching to console is not possible.
+Solution is to disable the power management in the BIOS (at least disable BIOS CPU speed throttling). This has no major affect on battery life since the OS is still able to throttle the CPU when neccessary.
+
+aura -A gnome-shell-cpufreq-git
+
+#cpupower is good for checking but current kernel defaults are fine and no changes needed to be made
+
+# thinkfan
+install thinkfan from aur
+enable the service
+
+
+#ALTERNATELY: I could create, for example, a top level volume called "archlinux" and a subvolume for root, pkgcache, etc. this would mean then mounting each of those on the correct path
+
+
+#btrfs subvolume set-default subvolume-id / # note this may break grub... grub may be expecting only the top level
+grub-install --recheck $DEV_ROOT
+
+
+
+NUVOLA PLAYER:
+-------------------------------------------------------
+pacman -S gst-plugins-ugly libgee06 libunique flashplugin lib32-flashplugin
+aura -A scour nuvolaplayer
+
+
+Install the necessary Flash dependencies by running one of the following commands:
+
+pacman -S flashplugin; # For 32-bit systems
+pacman -S lib32-flashplugin; # For 64-bit systems
+Alternatively, you can just install dependencies of these packages, see flashplugin 32bit or flashplugin 64bit for a list of dependencies.
+
+You have to install also lib32-libpulse and lib32-alsa-plugins on 64-bit systems.
+
+pacman -S lib32-libpulse lib32-alsa-plugins; # For 64-bit systems
+Install nspluginwrapper:
+
+pacman -S nspluginwrapper
+Download script nuvolaplayer-flashplugin-installer
+
+Run the script to install wrapped Flash plugin.
+
+SKIP THIS? I did it manually:
+sudo bash ./nuvolaplayer-flashplugin-installer --install --force
+
+Manual method:
+
+sudo nspluginwrapper -v -n -i /usr/lib32/mozilla/plugins/libflashplayer.so
+sudo mkdir -p /opt/nuvolaplayer/flash/{orig,wrapped}
+sudo mv /usr/lib/mozilla/plugins/npwrapper.libflashplayer.so /opt/nuvolaplayer/flash/wrapped/
+sudo cp /usr/lib32/mozilla/plugins/libflashplayer.so /opt/nuvolaplayer/flash/orig/
+
+
+
+
+# ------------------------------------------------------------------------------
+IGNORE
+# ------------------------------------------------------------------------------
