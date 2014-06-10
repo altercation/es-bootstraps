@@ -32,11 +32,11 @@ rm -rf ${PKG}*
 }
 
 sudo pacman -Sy
-install_aur cower
-install_aur pacaur
+which cower || install_aur cower
+which pacaur || install_aur pacaur
 which mr || pacaur --noconfirm --noedit -S myrepos
 which vcsh || pacaur --noconfirm --noedit -S vcsh
-sudo pacman --noconfirm -S hub
+which hub || sudo pacman --noconfirm -S hub
 
 vcsh clone https://github.com/altercation/es-dotfiles.git es-dotfiles || true
 mr update || true
