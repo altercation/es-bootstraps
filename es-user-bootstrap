@@ -8,6 +8,7 @@ desc: bootstrap script to setup my user environment on a new machine
       platforms in future)
 author: Ethan Schoonover <es@ethanschoonover.com>
 requires: bash sudo
+usage: curl -L http://links.ethanschoonover.com/user-bootstrap | bash
 -----------------------------------------------------------------------
 
 set -o errexit
