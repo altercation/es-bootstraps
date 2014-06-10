@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+i:<<\
+'-----------------------------------------------------------------------'
+name: es-user-bootstrap
+desc: bootstrap script to setup my user environment on a new machine
+      (currently primarily for Arch Linux, could be customized for other
+      platforms in future)
+author: Ethan Schoonover <es@ethanschoonover.com>
+requires: bash sudo
+-----------------------------------------------------------------------
+
+set -o errexit
+
+if [[ "$(whoami)" == "root" ]]; then
+    print "Must be normal user to run this install script. Exiting."
+    exit
+fi
+
+install_aur () {
+PKG=$1
+[ -d ${HOME}/tmp ] || mkdir $HOME/tmp
+cd $HOME/tmp
+rm -rf ${PKG}*
+curl -O https://aur.archlinux.org/packages/${PKG:0:2}/${PKG}/${PKG}.tar.gz
+tar -xzvf ${PKG}.tar.gz
+cd ${PKG}
+makepkg --noconfirm --syncdeps --clean --needed --install
+cd $HOME/tmp
+rm -rf ${PKG}*
+}
+
+sudo pacman -Sy
+install_aur cower
+install_aur pacaur
+which mr || pacaur --noconfirm --noedit -S myrepos
+which vcsh || pacaur --noconfirm --noedit -S vcsh
+pacaur --noconfirm -R ruby-ronn
+pacman --noconfirm -S hub
+
+vcsh clone https://github.com/altercation/es-config.git es-config
+mr update
+
+[ -e ${HOME}/.ssh/id_ecdsa.pub ] || ssh-keygen -t ecdsa -b 521 -C "$(whoami)@$(hostname)-$(date -I)"
+xclip -sel clip < ~/.ssh/id_ecdsa.pub
+echo "ssh public key copied to clipboard"
+
