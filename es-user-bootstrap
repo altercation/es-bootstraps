@@ -37,7 +37,7 @@ which mr || pacaur --noconfirm --noedit -S myrepos
 which vcsh || pacaur --noconfirm --noedit -S vcsh
 sudo pacman --noconfirm -S hub
 
-vcsh clone https://github.com/altercation/es-config.git es-config
+vcsh clone https://github.com/altercation/es-dotfiles.git es-dotfiles
 mr update
 
 [ -e ${HOME}/.ssh/id_ecdsa.pub ] || ssh-keygen -t ecdsa -b 521 -C "$(whoami)@$(hostname)-$(date -I)"
