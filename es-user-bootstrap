@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-i:<<\
+:<<\
 '-----------------------------------------------------------------------'
 name: es-user-bootstrap
 desc: bootstrap script to setup my user environment on a new machine
