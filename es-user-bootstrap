@@ -35,7 +35,7 @@ install_aur cower
 install_aur pacaur
 which mr || pacaur --noconfirm --noedit -S myrepos
 which vcsh || pacaur --noconfirm --noedit -S vcsh
-pacman --noconfirm -S hub
+sudo pacman --noconfirm -S hub
 
 vcsh clone https://github.com/altercation/es-config.git es-config
 mr update
